@@ -10,7 +10,13 @@
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -46,7 +52,9 @@ if (!bytes.subarray(0, 8).equals(PNG_SIGNATURE)) {
 }
 
 // The IHDR chunk follows the signature: 4-byte length, "IHDR", then width
-// and height as 4-byte big-endian integers.
+// and height as 4-byte big-endian integers, then the bit depth and the
+// colour type. Both fields have a small set of legal values; anything
+// else means the header is corrupt even if the lengths look right.
 const ihdrLength: number = bytes.readUInt32BE(8);
 const ihdrType: string = bytes.subarray(12, 16).toString("latin1");
 if (ihdrLength !== 13 || ihdrType !== "IHDR") {
@@ -57,27 +65,71 @@ const height: number = bytes.readUInt32BE(20);
 if (width > 1024 || height > 1024) {
   throw new Error(`entry.png is ${width}x${height}, over the 1024x1024 cap`);
 }
+const bitDepth: number = bytes[24];
+const colourType: number = bytes[25];
+if (![1, 2, 4, 8, 16].includes(bitDepth)) {
+  throw new Error(`entry.png has an impossible IHDR bit depth: ${bitDepth}`);
+}
+if (![0, 2, 3, 4, 6].includes(colourType)) {
+  throw new Error(`entry.png has an impossible IHDR colour type: ${colourType}`);
+}
+
+// PNG guards every chunk with a CRC-32 (the reflected IEEE polynomial,
+// as in zip) over the chunk type and its data. The table is built once;
+// checking each chunk's stored CRC against the computed one catches a
+// file whose bytes were damaged in a way the length walk alone would
+// step over, because a flipped byte inside a chunk keeps every length
+// and offset exactly where it was.
+const CRC_TABLE: Int32Array = (() => {
+  const table = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c;
+  }
+  return table;
+})();
+
+function crc32(buf: Buffer): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc = CRC_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
 
 // Walk the chunk list to the IEND chunk so a truncated file fails here
-// instead of passing a partial image to the judge. IEND must also be the
-// last chunk: bytes trailing after it would mean the file is not one whole
-// image but an image with something appended.
+// instead of passing a partial image to the judge. Every chunk's CRC is
+// verified on the way. IEND must also be the last chunk: bytes trailing
+// after it would mean the file is not one whole image but an image with
+// something appended.
 let offset = 8;
 let sawIend = false;
 while (offset + 8 <= bytes.length) {
   const chunkLength: number = bytes.readUInt32BE(offset);
   const chunkType: string = bytes.subarray(offset + 4, offset + 8).toString("latin1");
+  const chunkEnd: number = offset + 8 + chunkLength + 4;
+  if (chunkEnd > bytes.length) {
+    throw new Error(`entry.png ends inside the ${chunkType} chunk`);
+  }
+  const storedCrc: number = bytes.readUInt32BE(offset + 8 + chunkLength);
+  const computedCrc: number = crc32(bytes.subarray(offset + 4, offset + 8 + chunkLength));
+  if (storedCrc !== computedCrc) {
+    throw new Error(`entry.png has a bad CRC in the ${chunkType} chunk`);
+  }
   if (chunkType === "IEND") {
     sawIend = true;
     // IEND carries no data, only its 4-byte CRC: the file must end here.
-    if (offset + 12 !== bytes.length) {
+    if (chunkEnd !== bytes.length) {
       throw new Error(
-        `entry.png has ${bytes.length - offset - 12} trailing bytes after IEND`,
+        `entry.png has ${bytes.length - chunkEnd} trailing bytes after IEND`,
       );
     }
     break;
   }
-  offset += 12 + chunkLength;
+  offset = chunkEnd;
 }
 if (!sawIend) {
   throw new Error("entry.png has no IEND chunk: the file looks truncated");
@@ -102,4 +154,6 @@ if (writtenHash !== sourceHash) {
   throw new Error(`wrote bytes to ${targetPath} whose SHA-256 differs from entry.png`);
 }
 
-console.log(`wrote ${targetPath} (${written} bytes, ${width}x${height})`);
+console.log(
+  `wrote ${targetPath} (${written} bytes, ${width}x${height}, sha256 ${sourceHash})`,
+);
